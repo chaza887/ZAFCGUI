@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fitness First Kings Cross Platinum — Weekly Class Digest
-Fetches the timetable, formats it, and sends via Gmail (or saves to file).
+Fetches the timetable, formats it, sends via Gmail, and creates calendar invites.
 """
 
 import os
@@ -11,8 +11,10 @@ import logging
 import re
 import time
 import smtplib
-import base64
+import uuid
 from datetime import datetime, date, timedelta
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from zoneinfo import ZoneInfo
@@ -43,6 +45,25 @@ RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "")
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", ".")
+
+# Calendar config
+# Comma-separated substrings (case-insensitive) to exclude from calendar invites.
+# e.g. "Reformer Pilates,Barre,Meditation"
+_excluded_raw = os.getenv("EXCLUDED_CLASSES", "")
+EXCLUDED_CLASSES: list[str] = [x.strip().lower() for x in _excluded_raw.split(",") if x.strip()]
+
+# If set, only classes whose names match one of these substrings get invites.
+# Leave empty to invite all non-excluded classes.
+_include_raw = os.getenv("CALENDAR_CLASSES", "")
+CALENDAR_CLASSES: list[str] = [x.strip().lower() for x in _include_raw.split(",") if x.strip()]
+
+# Minutes before class to fire a reminder notification (default 30).
+CALENDAR_REMINDER_MINUTES: int = int(os.getenv("CALENDAR_REMINDER_MINUTES", "30"))
+
+# Google Calendar — optional push via service account.
+# Set GOOGLE_CALENDAR_ID and point GOOGLE_SERVICE_ACCOUNT_JSON at your key file.
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +397,221 @@ def normalise_classes(raw: list) -> dict[str, list]:
 
 
 # ---------------------------------------------------------------------------
+# Step 2.5 — Filter classes for calendar invites
+# ---------------------------------------------------------------------------
+
+def _class_matches(name: str, patterns: list[str]) -> bool:
+    name_lower = name.lower()
+    return any(p in name_lower for p in patterns)
+
+
+def filter_for_calendar(grouped: dict[str, list]) -> dict[str, list]:
+    """
+    Return a filtered copy of *grouped* containing only the classes that
+    should receive calendar invites.
+
+    - Always drops classes matching EXCLUDED_CLASSES.
+    - If CALENDAR_CLASSES is set, keeps only classes matching that list.
+    - If CALENDAR_CLASSES is empty, keeps everything not excluded.
+    """
+    result: dict[str, list] = {}
+    for day, classes in grouped.items():
+        kept = []
+        for cls in classes:
+            name = cls["name"]
+            if EXCLUDED_CLASSES and _class_matches(name, EXCLUDED_CLASSES):
+                log.debug("Excluding '%s' from calendar.", name)
+                continue
+            if CALENDAR_CLASSES and not _class_matches(name, CALENDAR_CLASSES):
+                continue
+            kept.append(cls)
+        if kept:
+            result[day] = kept
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Step 2.6 — Build ICS and push to Google Calendar
+# ---------------------------------------------------------------------------
+
+def _duration_to_minutes(duration_str: str) -> int:
+    """Parse '45 min' or '1 hr' into total minutes. Defaults to 60."""
+    if not duration_str:
+        return 60
+    m = re.search(r"(\d+)\s*(min|hr)", duration_str, re.I)
+    if not m:
+        return 60
+    value, unit = int(m.group(1)), m.group(2).lower()
+    return value if unit == "min" else value * 60
+
+
+def _ics_dt(dt: datetime) -> str:
+    """Format a Sydney-aware datetime for TZID-based ICS DTSTART/DTEND."""
+    return dt.strftime("%Y%m%dT%H%M%S")
+
+
+def _ics_utc_now() -> str:
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+
+def build_ics(filtered: dict[str, list]) -> bytes:
+    """
+    Build an iCalendar (.ics) byte string for all classes in *filtered*.
+    Each class becomes a VEVENT with a reminder alarm.
+    """
+    monday, _ = _week_bounds()
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//ZAFCGUI//Fitness First Digest//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-TIMEZONE:Australia/Sydney",
+        "X-WR-CALNAME:Fitness First Kings Cross Platinum",
+    ]
+
+    for day in DAYS_ORDER:
+        if day not in filtered:
+            continue
+        class_date = _day_date(day, monday)
+        for cls in filtered[day]:
+            t = cls.get("time_obj")
+            if not t:
+                continue
+            start_dt = datetime.combine(class_date, t, tzinfo=SYDNEY_TZ)
+            duration_min = _duration_to_minutes(cls["duration"])
+            end_dt = start_dt + timedelta(minutes=duration_min)
+
+            instructor = cls["instructor"]
+            summary = cls["name"] + (f" with {instructor}" if instructor else "")
+            description = (
+                f"Class: {cls['name']}\\n"
+                f"Time: {cls['time']}\\n"
+                f"Duration: {cls['duration'] or 'N/A'}\\n"
+                + (f"Instructor: {instructor}\\n" if instructor else "")
+                + f"Book at: {TIMETABLE_URL}"
+            )
+
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:{uuid.uuid4()}@fitnessfirst-digest",
+                f"DTSTAMP:{_ics_utc_now()}",
+                f"DTSTART;TZID=Australia/Sydney:{_ics_dt(start_dt)}",
+                f"DTEND;TZID=Australia/Sydney:{_ics_dt(end_dt)}",
+                f"SUMMARY:{summary}",
+                f"DESCRIPTION:{description}",
+                "LOCATION:Fitness First Kings Cross Platinum\\, 100 William St\\, Sydney NSW 2011",
+                f"URL:{TIMETABLE_URL}",
+                "BEGIN:VALARM",
+                f"TRIGGER:-PT{CALENDAR_REMINDER_MINUTES}M",
+                "ACTION:DISPLAY",
+                "DESCRIPTION:Reminder",
+                "END:VALARM",
+                "END:VEVENT",
+            ]
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines).encode("utf-8")
+
+
+def save_ics(ics_bytes: bytes) -> str:
+    """Write the ICS to disk and return the file path."""
+    today_str = date.today().strftime("%Y-%m-%d")
+    path = os.path.join(OUTPUT_DIR, f"fitness_classes_{today_str}.ics")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(ics_bytes)
+    log.info("ICS file saved to %s", path)
+    return path
+
+
+def push_to_google_calendar(filtered: dict[str, list]) -> list[str]:
+    """
+    Create Google Calendar events for each class in *filtered* using a
+    service account. Returns a list of created event HTML links.
+
+    Requires:
+      GOOGLE_CALENDAR_ID   — target calendar ID
+      GOOGLE_SERVICE_ACCOUNT_JSON — path to service-account key JSON
+
+    The service account must have been granted write access to the calendar
+    (share the calendar with the service account email).
+    """
+    if not GOOGLE_CALENDAR_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        log.info("Google Calendar push skipped — credentials not configured.")
+        return []
+
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build as gcal_build
+    except ImportError:
+        log.error(
+            "Google client libs not installed. "
+            "Run: pip install google-api-python-client google-auth"
+        )
+        return []
+
+    scopes = ["https://www.googleapis.com/auth/calendar.events"]
+    creds = service_account.Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_JSON, scopes=scopes
+    )
+    service = gcal_build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+    monday, _ = _week_bounds()
+    created_links: list[str] = []
+
+    for day in DAYS_ORDER:
+        if day not in filtered:
+            continue
+        class_date = _day_date(day, monday)
+        for cls in filtered[day]:
+            t = cls.get("time_obj")
+            if not t:
+                continue
+            start_dt = datetime.combine(class_date, t, tzinfo=SYDNEY_TZ)
+            duration_min = _duration_to_minutes(cls["duration"])
+            end_dt = start_dt + timedelta(minutes=duration_min)
+
+            instructor = cls["instructor"]
+            body = {
+                "summary": cls["name"] + (f" with {instructor}" if instructor else ""),
+                "location": "Fitness First Kings Cross Platinum, 100 William St, Sydney NSW 2011",
+                "description": (
+                    f"Duration: {cls['duration'] or 'N/A'}\n"
+                    + (f"Instructor: {instructor}\n" if instructor else "")
+                    + f"Book at: {TIMETABLE_URL}"
+                ),
+                "start": {
+                    "dateTime": start_dt.isoformat(),
+                    "timeZone": "Australia/Sydney",
+                },
+                "end": {
+                    "dateTime": end_dt.isoformat(),
+                    "timeZone": "Australia/Sydney",
+                },
+                "reminders": {
+                    "useDefault": False,
+                    "overrides": [
+                        {"method": "popup", "minutes": CALENDAR_REMINDER_MINUTES},
+                    ],
+                },
+            }
+            try:
+                event = (
+                    service.events()
+                    .insert(calendarId=GOOGLE_CALENDAR_ID, body=body)
+                    .execute()
+                )
+                link = event.get("htmlLink", "")
+                log.info("Created Google Calendar event: %s — %s", cls["name"], link)
+                created_links.append(link)
+            except Exception as exc:
+                log.error("Failed to create event for '%s': %s", cls["name"], exc)
+
+    return created_links
+
+
+# ---------------------------------------------------------------------------
 # Step 3 — Format the email
 # ---------------------------------------------------------------------------
 
@@ -453,9 +689,12 @@ def format_failure_email() -> tuple[str, str]:
 # Step 4 — Send via Gmail (SMTP + App Password) or save to file
 # ---------------------------------------------------------------------------
 
-def send_via_gmail(subject: str, body: str) -> bool:
+def send_via_gmail(
+    subject: str, body: str, ics_bytes: bytes | None = None
+) -> bool:
     """
     Send an email using Gmail SMTP with an App Password.
+    If *ics_bytes* is provided it is attached as a calendar invite (.ics).
     Returns True on success, False on failure.
     """
     if not all([GMAIL_SENDER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL]):
@@ -466,11 +705,24 @@ def send_via_gmail(subject: str, body: str) -> bool:
         )
         return False
 
-    msg = MIMEMultipart("alternative")
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = GMAIL_SENDER
     msg["To"] = RECIPIENT_EMAIL
     msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    if ics_bytes:
+        today_str = date.today().strftime("%Y-%m-%d")
+        ics_part = MIMEBase("text", "calendar", method="PUBLISH", name=f"fitness_classes_{today_str}.ics")
+        ics_part.set_payload(ics_bytes)
+        encoders.encode_base64(ics_part)
+        ics_part.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename=f"fitness_classes_{today_str}.ics",
+        )
+        msg.attach(ics_part)
+        log.info("ICS attachment added to email (%d events).", ics_bytes.count(b"BEGIN:VEVENT"))
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
@@ -501,6 +753,11 @@ def save_to_file(subject: str, body: str) -> str:
 def main():
     log.info("=== Fitness First Weekly Digest — %s ===", date.today().isoformat())
 
+    if EXCLUDED_CLASSES:
+        log.info("Excluded class patterns: %s", ", ".join(EXCLUDED_CLASSES))
+    if CALENDAR_CLASSES:
+        log.info("Calendar include patterns: %s", ", ".join(CALENDAR_CLASSES))
+
     try:
         raw_classes = fetch_timetable()
     except RuntimeError as exc:
@@ -518,7 +775,21 @@ def main():
     print(f"\nSubject: {subject}\n")
     print(body)
 
-    sent = send_via_gmail(subject, body)
+    # --- Calendar invites ---------------------------------------------------
+    calendar_grouped = filter_for_calendar(grouped)
+    ics_bytes: bytes | None = None
+
+    if calendar_grouped:
+        total_cal = sum(len(v) for v in calendar_grouped.values())
+        log.info("Generating calendar invites for %d class(es).", total_cal)
+        ics_bytes = build_ics(calendar_grouped)
+        save_ics(ics_bytes)
+        push_to_google_calendar(calendar_grouped)
+    else:
+        log.info("No classes qualify for calendar invites.")
+
+    # --- Email --------------------------------------------------------------
+    sent = send_via_gmail(subject, body, ics_bytes=ics_bytes)
     if not sent:
         path = save_to_file(subject, body)
         print(f"\nDigest saved to: {path}")
